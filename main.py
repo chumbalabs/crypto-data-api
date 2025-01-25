@@ -1,13 +1,12 @@
 # main.py
 from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 import requests
 import numpy as np
 import os
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from typing import Optional, List
+from typing import List, Dict
 from sklearn.linear_model import LinearRegression
 from cachetools import TTLCache
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -16,17 +15,22 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 # Configuration
 # ---------------------------
 BINANCE_API = os.getenv("BINANCE_API", "https://api.binance.com/api/v3")
-CACHE_TTL = int(os.getenv("CACHE_TTL", 300))  # 5 minutes caching
+CACHE_TTL = int(os.getenv("CACHE_TTL", 120))  # 2 minutes caching
+ALLOWED_INTERVALS = ["1h", "4h", "1d", "1w"]
+INTERVAL_HOURS = {"1h": 1, "4h": 4, "1d": 24, "1w": 168}
+
+# Caching setup
 SYMBOLS_CACHE = TTLCache(maxsize=1, ttl=CACHE_TTL)
-PRICE_CACHE = TTLCache(maxsize=100, ttl=60)  # 1 minute cache for prices
+OHLCV_CACHE = TTLCache(maxsize=500, ttl=300)
+PREDICTION_CACHE = TTLCache(maxsize=100, ttl=600)
 
 # ---------------------------
 # FastAPI Setup
 # ---------------------------
 app = FastAPI(
-    title="CryptoPredict Pro",
-    description="Real-time Crypto Prices & Predictions",
-    version="0.1.0"
+    title="CryptoPredict Pro+",
+    description="Advanced Crypto Analytics & Predictions",
+    version="0.2.1"
 )
 
 app.add_middleware(
@@ -37,33 +41,51 @@ app.add_middleware(
 )
 
 # ---------------------------
-# Prediction Model
+# Enhanced Prediction Model
 # ---------------------------
-class PredictionModel:
+class AdvancedPredictor:
     def __init__(self):
-        self.model = LinearRegression()
+        self.models = {
+            "linear": LinearRegression(),
+            "moving_avg": self._create_moving_avg_model()
+        }
         
-    def train_and_predict(self, prices: List[float], lookback_hours: int = 48) -> dict:
-        """Simple linear regression prediction"""
-        if len(prices) < lookback_hours:
+    def _create_moving_avg_model(self):
+        """Simple moving average model"""
+        class MovingAverage:
+            def predict(self, prices, window=3):
+                return np.convolve(prices, np.ones(window)/window, mode='valid')[-1]
+        return MovingAverage()
+    
+    def _calculate_confidence(self, prices):
+        """Multi-factor confidence calculation"""
+        volatility = np.std(prices[-24:]) / np.mean(prices[-24:])
+        trend_strength = np.polyfit(range(len(prices)), prices, 1)[0]
+        return max(0.4, min(0.95, 1 - volatility + abs(trend_strength*100)))
+
+    def predict(self, prices: List[float], interval: str) -> dict:
+        """Enhanced prediction with multiple models"""
+        if len(prices) < 48:
             raise ValueError("Insufficient historical data")
             
         X = np.arange(len(prices)).reshape(-1, 1)
         y = np.array(prices)
-        self.model.fit(X, y)
         
-        prediction = self.model.predict([[len(prices)]])[0]
-        confidence = max(0.5, min(0.9, 1 - (np.std(y[-24:]) / y[-1])))  # Volatility-based confidence
+        self.models["linear"].fit(X, y)
+        lr_pred = self.models["linear"].predict([[len(X)]])[0]
+        ma_pred = self.models["moving_avg"].predict(y)
         
         return {
-            "prediction": round(float(prediction), 4),
-            "confidence": round(float(confidence), 4)
+            "prediction": round(float((lr_pred * 0.6) + (ma_pred * 0.4)), 4),
+            "confidence": round(float(self._calculate_confidence(prices)), 4),
+            "interval": interval,
+            "last_updated": datetime.now(timezone.utc).isoformat()
         }
 
-predictor = PredictionModel()
+predictor = AdvancedPredictor()
 
 # ---------------------------
-# Binance API Client
+# Binance API Client (Enhanced)
 # ---------------------------
 class BinanceClient:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -74,25 +96,50 @@ class BinanceClient:
         return [s["symbol"] for s in data["symbols"] if s["status"] == "TRADING"]
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def fetch_price_data(self, symbol: str, hours: int) -> List[float]:
-        """Fetch historical prices with retry logic"""
-        limit = min(max(hours * 2, 24), 168)  # 1 week max data
+    def fetch_ohlcv(self, symbol: str, interval: str = "1h", limit: int = 100) -> List[Dict]:
+        """Fetch OHLCV data with structured response"""
+        cache_key = f"{symbol}_{interval}"
+        if cache_key in OHLCV_CACHE:
+            return OHLCV_CACHE[cache_key]
+            
         response = requests.get(
-            f"{BINANCE_API}/klines?symbol={symbol}&interval=1h&limit={limit}"
+            f"{BINANCE_API}/klines?symbol={symbol}&interval={interval}&limit={limit}"
         )
-        return [float(entry[4]) for entry in response.json()]
+        data = response.json()
+        
+        ohlcv = [{
+            "timestamp": entry[0],
+            "open": float(entry[1]),
+            "high": float(entry[2]),
+            "low": float(entry[3]),
+            "close": float(entry[4]),
+            "volume": float(entry[5]),
+        } for entry in data]
+        
+        OHLCV_CACHE[cache_key] = ohlcv
+        return ohlcv
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def fetch_current_price(self, symbol: str) -> float:
+        """Get current price with caching"""
+        if symbol in OHLCV_CACHE:
+            return OHLCV_CACHE[symbol][-1]["close"]
+            
+        response = requests.get(f"{BINANCE_API}/ticker/price?symbol={symbol}")
+        data = response.json()
+        return float(data["price"])
 
 binance = BinanceClient()
 
 # ---------------------------
-# API Endpoints
+# Enhanced API Endpoints
 # ---------------------------
 @app.get("/")
 async def root():
     return {
-        "name": "CryptoPredict Pro",
+        "name": "CryptoPredict Pro+",
         "status": "online",
-        "timestamp": datetime.utcnow()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 @app.get("/symbols")
@@ -108,51 +155,59 @@ async def get_active_symbols():
             detail=f"Symbols service unavailable: {str(e)}"
         )
 
-@app.get("/price/{symbol}")
-async def get_current_price(symbol: str):
-    """Get current price with caching"""
+@app.get("/historical/{symbol}")
+async def get_historical_data(
+    symbol: str, 
+    interval: str = "1h",
+    limit: int = 100
+):
+    """Get OHLCV data for charting"""
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid interval. Allowed: {ALLOWED_INTERVALS}"
+        )
+        
     try:
-        if symbol not in PRICE_CACHE:
-            response = requests.get(f"{BINANCE_API}/ticker/price?symbol={symbol}")
-            data = response.json()
-            PRICE_CACHE[symbol] = float(data["price"])
-            
+        ohlcv = binance.fetch_ohlcv(symbol, interval, limit)
         return {
             "symbol": symbol,
-            "price": PRICE_CACHE[symbol],
-            "timestamp": datetime.utcnow()
+            "interval": interval,
+            "data": ohlcv,
+            "count": len(ohlcv),
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Price check failed: {str(e)}"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Data fetch failed: {str(e)}"
         )
 
 @app.get("/predict/{symbol}")
-async def predict_price(symbol: str, hours: int = 24):
-    """Price prediction endpoint"""
+async def predict_price(
+    symbol: str,
+    interval: str = "1h",
+    prediction_window: int = 24
+):
+    """Enhanced prediction endpoint"""
     try:
-        # Validate input
-        if hours < 1 or hours > 48:
+        if interval not in ALLOWED_INTERVALS:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Hours must be between 1 and 48"
+                detail=f"Invalid interval. Allowed: {ALLOWED_INTERVALS}"
             )
             
-        # Fetch data
-        prices = binance.fetch_price_data(symbol, hours)
-        
-        # Generate prediction
-        prediction = predictor.train_and_predict(prices)
+        ohlcv = binance.fetch_ohlcv(symbol, interval)
+        closes = [entry["close"] for entry in ohlcv]
+        prediction = predictor.predict(closes, interval)
         
         return {
             "symbol": symbol,
-            "current_price": prices[-1],
-            "prediction_window_hours": hours,
-            **prediction,
-            "timestamp": datetime.utcnow()
+            "interval": interval,
+            "current_price": closes[-1],
+            "prediction_window": f"{prediction_window * INTERVAL_HOURS[interval]}h",
+            **prediction
         }
-        
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
